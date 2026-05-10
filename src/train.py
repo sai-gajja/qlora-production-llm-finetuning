@@ -10,7 +10,7 @@ from trl import SFTTrainer
 from datasets import load_from_disk
 from utils import find_target_modules, count_parameters
 import wandb
-import time
+import psutil
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -25,13 +25,13 @@ def parse_args():
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--use_4bit", action="store_true", default=True)
-    parser.add_argument("--use_bf16", action="store_true", default=False)  # newer GPUs
+    parser.add_argument("--use_bf16", action="store_true", default=False,
+                        help="Use bfloat16 for model weights (no automatic mixed precision)")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--system_prompt", type=str, default="You are a helpful assistant.")
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--packing_train", action="store_true", default=True)
-    parser.add_argument("--packing_eval", action="store_true", default=False)  # separate
     return parser.parse_args()
 
 def main():
@@ -40,9 +40,21 @@ def main():
     if args.use_wandb:
         wandb.init(project="llm-finetune-prod", config=vars(args))
 
-    # Quantization config
-    bnb_config = None
+    # ---------- BFloat16 capability check ----------
+    if args.use_bf16:
+        if not torch.cuda.is_available():
+            print("⚠️  --use_bf16 requires CUDA. Falling back to float16.")
+            args.use_bf16 = False
+        else:
+            major, minor = torch.cuda.get_device_capability()
+            if major < 8:
+                print(f"⚠️  GPU compute capability {major}.{minor} does not support BFloat16. Falling back to float16.")
+                args.use_bf16 = False
+
+    # ---------- Quantization config ----------
+    # Compute dtype: only used for 4-bit compute, not for AMP
     compute_dtype = torch.bfloat16 if args.use_bf16 else torch.float16
+    bnb_config = None
     if args.use_4bit:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -51,24 +63,30 @@ def main():
             bnb_4bit_use_double_quant=True,
         )
 
-    # Load model
+    # ---------- Load model ----------
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
-        use_cache=False
+        use_cache=False,
+        torch_dtype=compute_dtype if not args.use_4bit else None,  # for non-quantized case
     )
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
+    # Enable gradient checkpointing without reentrancy warning
+    try:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except TypeError:
+        # Older PyTorch versions
+        model.gradient_checkpointing_enable()
     model = prepare_model_for_kbit_training(model)
 
-    # Tokenizer
+    # ---------- Tokenizer ----------
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # LoRA
+    # ---------- LoRA ----------
     target_modules = find_target_modules(model)
     print(f"Target modules: {target_modules}")
     lora_config = LoraConfig(
@@ -77,7 +95,7 @@ def main():
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=target_modules
+        target_modules=target_modules,
     )
     model = get_peft_model(model, lora_config)
 
@@ -86,10 +104,31 @@ def main():
     if args.use_wandb:
         wandb.log({"total_params": total_params, "trainable_params": trainable_params})
 
-    # Dataset
+    # ---------- Dataset (keep only "text" column) ----------
     dataset = load_from_disk(args.data_path)
+    for split in ["train", "validation"]:
+        if split not in dataset:
+            continue
+        cols = dataset[split].column_names
+        if "text" not in cols:
+            raise ValueError(f"Dataset {split} has no 'text' column. Found: {cols}")
+        to_remove = [c for c in cols if c != "text"]
+        if to_remove:
+            print(f"Removing columns from {split}: {to_remove}")
+            dataset[split] = dataset[split].remove_columns(to_remove)
 
-    # Training arguments with scheduler, clipping, early stopping
+    # ---------- Training arguments ----------
+    total_train_samples = len(dataset["train"])
+    effective_batch_size = args.batch_size * args.grad_accum
+    steps_per_epoch = (total_train_samples + effective_batch_size - 1) // effective_batch_size
+    total_steps = steps_per_epoch * args.num_epochs
+    warmup_steps = int(0.03 * total_steps)
+
+    cpu_count = psutil.cpu_count(logical=True)
+    num_workers = min(4, cpu_count // 2 if cpu_count else 2)
+
+    # CRITICAL: Disable automatic mixed precision to avoid gradient scaler with BFloat16
+    # We set both fp16 and bf16 to False. The model already uses bf16 (if requested) natively.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -98,57 +137,35 @@ def main():
         num_train_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_steps=warmup_steps,
         max_grad_norm=1.0,
-        fp16=not args.use_bf16,
-        bf16=args.use_bf16,
+        fp16=False,                     # No FP16 AMP
+        bf16=False,                     # No BFloat16 AMP (model is already bf16)
         logging_steps=10,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=50,
-        save_strategy="epoch",
-        save_total_limit=2,
+        save_strategy="steps",
+        save_steps=50,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         remove_unused_columns=False,
         report_to="wandb" if args.use_wandb else "tensorboard",
         seed=args.seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=num_workers,
     )
 
-    # Custom data collator for token masking (mask non‑assistant tokens)
-    # We need to use DataCollatorForCompletionOnlyLM – but SFTTrainer can handle it via `data_collator`
-    # However, SFTTrainer already does instruction masking if we use `response_template`.
-    # We'll use the `response_template` parameter.
-    response_template = tokenizer.encode("\n### Response:\n", add_special_tokens=False)[2:]  # heuristic; better to use chat template
-    # For simplicity, we rely on SFTTrainer's built‑in masking when we pass `formatting_func` that returns only assistant part? Actually,
-    # the proper way: use `DataCollatorForCompletionOnlyLM` from trl.
-    from trl import DataCollatorForCompletionOnlyLM
-    # Example: we assume assistant token is "<|assistant|>" in the chat template.
-    # We'll just use the generic approach: use the response_template as the separator.
-    # But because our dataset already has full text, we can use the same collator.
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template,
-        tokenizer=tokenizer,
-        mlm=False
-    )
-
+    # ---------- Create SFTTrainer (modern single-column text mode) ----------
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"],
-        tokenizer=tokenizer,
-        max_seq_length=args.max_seq_length,
-        formatting_func=lambda x: x["text"],
-        packing=args.packing_train,
-        data_collator=collator,   # applies token masking
+        eval_dataset=dataset["validation"]
     )
 
-    # Early stopping
     trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=3))
 
-    # Start training with resume support
+    # ---------- Train ----------
     trainer.train(resume_from_checkpoint=args.resume_from)
 
     # Save final adapter
