@@ -1,0 +1,32 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "instruction": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "input": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "output": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "prompt": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "response": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "text": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

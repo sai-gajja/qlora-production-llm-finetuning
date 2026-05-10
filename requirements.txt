@@ -13,6 +13,3 @@ tensorboard
 scipy
 sentencepiece
 einops
-flash-attn>=2.3.0          # optional
-unsloth                    # optional
-deepspeed                  # optional, for multi‑GPU

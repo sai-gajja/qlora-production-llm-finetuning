@@ -60,14 +60,31 @@ def clean_and_split_data(input_jsonl, tokenizer_name, system_prompt=None, val_ra
     train_dataset = Dataset.from_list(train_data).map(build_prompt_and_response)
     val_dataset = Dataset.from_list(val_data).map(build_prompt_and_response)
 
-    # Version metadata
     version = dataset_version_hash(input_jsonl)
-    dataset_dict = DatasetDict({"train": train_dataset, "validation": val_dataset})
-    dataset_dict.info.description = f"Dataset version: {version}, seed: {seed}, system_prompt: {system_prompt}"
-    return dataset_dict, tokenizer
 
+    dataset_dict = DatasetDict({
+        "train": train_dataset,
+        "validation": val_dataset
+    })
+
+    # Store metadata separately
+    metadata = {
+        "version": version,
+        "seed": seed,
+        "system_prompt": system_prompt
+    }
+
+    return dataset_dict, tokenizer, metadata
 if __name__ == "__main__":
-    ds, tok = clean_and_split_data("data/raw_data.jsonl", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    ds, tok, metadata = clean_and_split_data(
+        "data/raw_data.jsonl",
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    )
+
     ds.save_to_disk("data/processed")
+
+    with open("data/processed/metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
     print(f"Train: {len(ds['train'])}, Val: {len(ds['validation'])}")
-    print(f"Version hash: {ds.info.description.split(':')[1].strip()}")
+    print(f"Version hash: {metadata['version']}")
